@@ -1,0 +1,8 @@
+# Virtual gamepad backends (platform-specific):
+#   Windows -> ViGEmBus driver + vgamepad
+#   Linux   -> evdev (uses the kernel uinput device)
+vgamepad>=0.1.0 ; sys_platform == "win32"
+evdev>=1.6 ; sys_platform == "linux"
+
+# Tests only (pc/test_abr.py): python3 -m pytest -q
+pytest>=7

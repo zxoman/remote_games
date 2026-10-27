@@ -1,0 +1,51 @@
+name: PS4 PKG
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build PS4 PKG
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld make cmake curl ca-certificates
+
+      - name: Cache OpenOrbis toolchain
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/openorbis
+          key: openorbis-v0.5.4
+
+      - name: Cache libjpeg + FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/runner/.cache/remote_games
+            ps4/third_party/libjpeg
+            ps4/third_party/ffmpeg
+          key: ps4-deps-jpeg3.0.4-ffmpeg-n5.1.6-${{ hashFiles('install/ci-build-ps4.sh', 'install/ps4-ld.sh') }}
+
+      - name: Build PKG
+        env:
+          OO_PS4_TOOLCHAIN: /home/runner/openorbis
+        run: bash install/ci-build-ps4.sh
+
+      - name: Upload PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverse-remote-play-ps4
+          path: ps4/IV0000-BREW00300_00-REMOTEPLAYREV000.pkg
+          if-no-files-found: error

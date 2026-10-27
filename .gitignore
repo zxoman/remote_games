@@ -1,0 +1,28 @@
+# Build artifacts
+ps4/build/
+*.o
+*.elf
+*.oelf
+*.self
+*.pkg
+ps4/eboot.bin
+ps4/pkg.gp4
+ps4/sce_sys/param.sfo
+
+# Third-party build outputs (regenerate in CI / install/ci-build-ps4.sh)
+ps4/third_party/libjpeg/
+ps4/third_party/ffmpeg/
+
+# Local toolchain downloads
+ps4-build-cache/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+pc/.portal_token
+
+# Editor
+.vscode/
+.idea/
