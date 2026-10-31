@@ -23,6 +23,10 @@ __pycache__/
 .venv/
 pc/.portal_token
 
+# Local-only scratch/credentials (never commit these)
+tel.py
+*.session
+
 # Editor
 .vscode/
 .idea/

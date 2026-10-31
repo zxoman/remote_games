@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 REM =====================================================================
 REM Reverse Remote Play (PS4 homebrew <-> PC) — Windows Build/Run Helper
 REM =====================================================================

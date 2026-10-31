@@ -75,8 +75,6 @@ def main() -> int:
             if pkt is None:
                 bad += 1
                 continue
-            print("ziad")
-
 
             if last_seq is not None and pkt.seq != (last_seq + 1) & 0xFF:
                 seq_gaps += 1
@@ -85,7 +83,6 @@ def main() -> int:
             last_pkt = pkt
 
             if pad is not None:
-                print("ziad")
                 pad.apply(pkt)
 
             if debug:

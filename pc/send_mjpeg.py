@@ -69,7 +69,7 @@ DEFAULTS = {
     "ffmpeg_input": "",
     "capture": "auto",
     "wayland_quality": 65,
-    "codec": "h264",
+    "codec": "auto",
     "h264_bitrate": 2500000,
     "h264_gop": 60,
     "h264_complexity": 0,
@@ -200,6 +200,39 @@ def resolve_backend(cfg, test_pattern):
     if not sys.platform.startswith("win") and os.environ.get("WAYLAND_DISPLAY"):
         return "wayland"
     return "ffmpeg"
+
+
+def h264_encoder_available():
+    """True if GStreamer can actually encode H.264 on this machine.
+
+    ``openh264enc`` is the only H.264 encoder the PC path drives (FFmpeg on
+    this host has no H.264 encoder), and ``grab_h264.py`` needs the GStreamer
+    Python bindings. A missing typelib, a missing GStreamer or a missing plugin
+    all mean "use MJPEG instead" rather than a hard failure.
+    """
+    try:
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+        return Gst.ElementFactory.find("openh264enc") is not None
+    except Exception:
+        return False
+
+
+def resolve_codec(cfg):
+    """Map ``codec = auto`` to ``h264`` or ``mjpeg``; validate explicit values.
+
+    Auto is the shipped default so the same config works on Linux (H.264) and
+    on Windows without GStreamer (MJPEG, ~10x the bandwidth but functional).
+    """
+    codec = str(cfg["codec"]).strip().lower()
+    if codec == "auto":
+        return "h264" if h264_encoder_available() else "mjpeg"
+    if codec not in ("h264", "mjpeg"):
+        raise SystemExit(f"[send_mjpeg] codec must be auto, h264 or mjpeg "
+                         f"(got {cfg['codec']!r})")
+    return codec
 
 
 def build_capture_argv(cfg, test_pattern, ffmpeg_bin, bitrate=None):
@@ -390,8 +423,9 @@ def main(argv=None):
                     help="raw FFmpeg input args (overrides platform capture)")
     ap.add_argument("--capture", choices=["auto", "wayland", "x11", "ffmpeg"],
                     help="capture backend (default auto: PipeWire on Wayland)")
-    ap.add_argument("--codec", choices=["mjpeg", "h264"],
-                    help="video codec (default h264; mjpeg = FFmpeg/jpegenc)")
+    ap.add_argument("--codec", choices=["auto", "mjpeg", "h264"],
+                    help="video codec (default auto: h264 when GStreamer can "
+                         "encode it, else mjpeg)")
     ap.add_argument("--bitrate", type=int, dest="h264_bitrate",
                     help="H.264 target bitrate in bits/s (codec=h264)")
     ap.add_argument("--gop", type=int, dest="h264_gop",
@@ -454,8 +488,13 @@ def main(argv=None):
     # definitions above).
     apply_quality_scale(cfg)
 
+    requested_codec = str(cfg["codec"]).strip().lower()
+    cfg["codec"] = resolve_codec(cfg)
     argv_cap = build_capture_argv(cfg, args.test_pattern, args.ffmpeg)
     is_h264 = cfg["codec"] == "h264"
+    if requested_codec == "auto":
+        print(f"[send_mjpeg] codec: auto -> {cfg['codec']} "
+              f"({'openh264enc found' if is_h264 else 'no GStreamer H.264 encoder'})")
     print(f"[send_mjpeg] codec={cfg['codec']} "
           f"({'H.264/GStreamer' if is_h264 else 'MJPEG/FFmpeg'})")
     if not is_h264:

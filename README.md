@@ -17,8 +17,10 @@ controls games running on the PC (virtual Xbox 360 pad on the PC).
 **Status: Phase 1 (input), Phase 2 (MJPEG), Phase 3 (H.264) and Steps 1–4
 (weak-network defaults, feedback channel, keyframe-on-demand, adaptive bitrate)
 implemented.**
-The video codec is selectable (`codec` in `pc/config.ini`); H.264 is the default
-because it gives far better quality per bit for Wi-Fi links. PC side runs on
+The video codec is selectable (`codec` in `pc/config.ini`): **auto** (the
+default) picks H.264 when GStreamer can encode it and falls back to MJPEG
+otherwise, so the same config works on Linux and on Windows without GStreamer.
+H.264 gives far better quality per bit for Wi-Fi links. PC side runs on
 Windows (ViGEmBus) and Linux (uinput).
 
 ## Repo layout
@@ -60,6 +62,16 @@ The PC side runs on **both** Windows and Linux. Pick the backend:
    ```
    (Reboot or reconnect the session after the group change.)
 5. Edit `pc/config.ini` if you don't like the defaults (ports, debug flag).
+
+**Windows shortcuts** (added from the Windows machine): `build.bat` in the repo
+root and `pc\run.bat` open a small menu for installing requirements, running the
+receiver, the fake PS4 input sender and the video sender. They are convenience
+wrappers only — the real commands are the ones documented below.
+
+**Codec on Windows:** `codec = auto` resolves to MJPEG when GStreamer (or the
+`openh264enc` plugin) is missing, so Windows works out of the box. Force
+`codec = h264` if you want a missing encoder to be a hard error. `openh264enc`
+is the only H.264 encoder the PC side drives (FFmpeg here has no H.264 encoder).
 
 ## PS4 setup — building the PKG
 
@@ -142,6 +154,16 @@ cd pc
 python fake_sender.py              # simulates a DS4 on localhost
 ```
 
+Another simulator, `pc/tools/fake_ps4_input.py`, sends real `RP4I` packets and
+can hold buttons, move sticks or generate a circle, which is handy for checking
+the virtual pad and the button mapping:
+
+```
+python tools/fake_ps4_input.py --btn cross --btn square
+python tools/fake_ps4_input.py --stick-l 32767,0
+python tools/fake_ps4_input.py --pattern circle
+```
+
 ## Running Phase 2 (MJPEG video)
 
 Requires **FFmpeg** on the PC (`ffmpeg` on `PATH`). The sender captures the
@@ -173,10 +195,11 @@ flags:
 
 ## Running Phase 3 (H.264 video)
 
-H.264 is the **default** (`codec = h264` in `pc/config.ini`) because it gives far
-better quality per bit than MJPEG, which matters over Wi-Fi. The PC encodes with
-GStreamer's `openh264enc` (via `grab_h264.py`); the PS4 decodes with FFmpeg +
-libswscale. `ffmpeg`/`ffmpeg-free` is **not** used for H.264 encoding.
+H.264 is what `codec = auto` picks on any machine where GStreamer can encode
+it, because it gives far better quality per bit than MJPEG over Wi-Fi. The PC
+encodes with GStreamer's `openh264enc` (via `grab_h264.py`); the PS4 decodes
+with FFmpeg + libswscale. `ffmpeg`/`ffmpeg-free` is **not** used for H.264
+encoding.
 
 ```
 cd pc
@@ -202,7 +225,7 @@ The defaults in `pc/config.ini` now target a weak/unstable Wi-Fi link:
 
 | Setting | Default | Why |
 |---------|---------|-----|
-| `codec` | `h264` | ~10× better quality per bit than MJPEG |
+| `codec` | `auto` | H.264 (10× better per bit) with a MJPEG fallback |
 | `h264_bitrate` | `2500000` | small keyframe bursts; fits a marginal link |
 | `width`/`height`/`fps` | `1280x720` / `30` | the PS4's expected geometry |
 | `h264_gop` | `60` (2 s) | safety net; on-demand IDRs recover faster (Step 3) |

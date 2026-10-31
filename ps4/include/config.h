@@ -6,8 +6,14 @@
  * file from the app's data directory (ux0:app/...) at startup.
  */
 
-/* PC's LAN IP (the machine running pc/receive_input.py). */
-#define CFG_PC_IP       "192.168.1.17"
+/* PC's LAN IP (the machine running pc/receive_input.py).
+ * The PS4 sends input, feedback (47002) and dlog (47003) here, so it must be
+ * an address that PC actually has. Nothing on the wire carries it, which is
+ * why the two machines' configs can disagree.
+ * Current setup: PS4 = 192.168.1.14, PC = 192.168.1.16 (DHCP) with .15 added
+ * as a secondary address (`ip addr add 192.168.1.15/24 dev eno1`) because the
+ * installed PKG was built against .15. */
+#define CFG_PC_IP       "192.168.1.15"
 
 /* PC input listener port (matches pc/config.ini [input] listen_port). */
 #define CFG_INPUT_PORT  47001
