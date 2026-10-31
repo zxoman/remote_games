@@ -79,8 +79,49 @@ unnamed `0x0001` bit is SHARE; once verified on hardware it can be mapped.
 | Sticks             | Left/Right stick        |
 
 *Note: face-button names above use Sony naming first; the "X/A/B/Y" column is
-the X360 position names (bottom/right/left/top). See `pc/vigem_client.py` for
+the X360 position names (bottom/right/left/top). See `pc/gamepad.py` for
 the canonical mapping actually used.*
+
+### Multiple controllers (`version = 2`)
+
+Player 1 (index 0) **always** uses the 18-byte version 1 packet above, so a PC
+receiver built before multi-pad support keeps working with a newer PS4. Players
+2–4 use version 2: the same 18 bytes, with `version = 0x02` and one extra byte
+appended.
+
+| Offset | Size | Field  | Notes |
+|--------|------|--------|-------|
+| 0..17  | 18   | —      | identical to the v1 packet body |
+| 18     | 1    | player | 0–3, the player slot this packet belongs to |
+
+A v2 packet is **19 bytes**, so old receivers reject it on length
+(`len(data) != 18`) and simply ignore the extra pads; they never misread them as
+player 1 data. The reverse is safe too: a new receiver accepts 18-byte v1
+packets as player 0.
+
+Compatibility matrix:
+
+| Sender / receiver | old PC receiver | new PC receiver |
+|-------------------|-----------------|-----------------|
+| old PS4 (v1 only) | player 1 works | player 1 works |
+| new PS4 (v1 + v2) | player 1 works, pads 2–4 ignored | all pads work |
+
+**Player mapping.** On the PS4, slot *i* is the *i*-th logged-in user
+(`sceUserServiceGetLoginUserIdList`), because the console ties each pad to a
+user account; there are at most four. The PC creates one virtual Xbox 360 pad
+per player, and pad creation is ordered: the first time player 3 is seen, pads
+for players 1 and 2 are created too, so a pad's XInput index always equals its
+player number.
+
+**Liveness.** The PS4 keeps sending a packet for every open pad at
+`CFG_INPUT_RATE_HZ` even when nothing changes, so silence means "gone". The PC
+resets (neutralises) a pad 1 s after its last packet; the PS4 closes a slot when
+`OrbisPadData.connected` stays 0 for 0.5 s and retries `scePadOpen` every 2 s,
+which also covers a pad connected after boot.
+
+`[input] max_players` (PC) limits how many virtual pads are created (1–4);
+`--players 1` restores the single-pad behaviour. The PS4 build does not need a
+setting: it sends every pad it can open.
 
 ---
 
@@ -193,6 +234,14 @@ Still planned: hardware `libSceVideodec2` decode and adaptive bitrate (Phase 4).
 
 Receivers must ignore packets whose `magic` doesn't match, and should log
 (and drop) packets with unexpected `version` rather than crash.
+
+The input channel uses `version` for a backward-compatible extension rather
+than a new magic: `1` is the original 18-byte packet (always player 1), `2`
+is 19 bytes and adds the player index. A new feature must follow the same
+rule — never change the meaning or layout of an existing version, and make
+sure an old receiver rejects the new shape on length/version alone. The video
+and feedback channels did the same with a flag bit and an impossible
+`chunk_cnt` (see §3 and §7.7).
 
 ---
 

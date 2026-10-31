@@ -13,6 +13,19 @@ INPUT_LEN = INPUT_STRUCT.size  # 18
 
 assert INPUT_LEN == 18
 
+# Multi-controller extension. Player 0 is *always* sent as the 18-byte version 1
+# packet so that a PC receiver built before multi-pad support keeps working with
+# a new PS4. Players 1..3 use version 2: the same 18 bytes with a trailing
+# player byte. Old receivers reject them on length, so they are ignored safely.
+INPUT_VERSION_MULTI = 2
+INPUT_MULTI_STRUCT = struct.Struct("<4sBBHBBhhhhB")
+INPUT_MULTI_LEN = INPUT_MULTI_STRUCT.size  # 19
+
+assert INPUT_MULTI_LEN == 19
+
+# A PS4 supports at most four logged-in users (and pads).
+INPUT_MAX_PLAYERS = 4
+
 # Button bits — keep in sync with docs/protocol.md
 BTN_SQUARE = 1 << 0
 BTN_CROSS = 1 << 1
@@ -51,23 +64,45 @@ class InputPacket:
     ly: int
     rx: int
     ry: int
+    player: int = 0        # 0..INPUT_MAX_PLAYERS-1; 0 -> classic 18-byte packet
+
+    def __post_init__(self):
+        # Keep `version` in sync with `player` so a packet is never built in a
+        # state that pack() cannot represent (v2 with player 0 is not emitted).
+        self.version = INPUT_VERSION if self.player == 0 else INPUT_VERSION_MULTI
 
     def pack(self) -> bytes:
+        if self.player:
+            return INPUT_MULTI_STRUCT.pack(
+                INPUT_MAGIC, INPUT_VERSION_MULTI, self.seq, self.buttons,
+                self.l2, self.r2, self.lx, self.ly, self.rx, self.ry,
+                self.player,
+            )
         return INPUT_STRUCT.pack(
-            INPUT_MAGIC, self.version, self.seq, self.buttons,
+            INPUT_MAGIC, INPUT_VERSION, self.seq, self.buttons,
             self.l2, self.r2, self.lx, self.ly, self.rx, self.ry,
         )
 
     @classmethod
     def unpack(cls, data: bytes):
         """Return InputPacket or None if the datagram isn't a valid RP4I packet."""
-        if len(data) != INPUT_LEN:
-            return None
-        magic, version, seq, buttons, l2, r2, lx, ly, rx, ry = \
-            INPUT_STRUCT.unpack(data)
-        if magic != INPUT_MAGIC or version != INPUT_VERSION:
-            return None
-        return cls(version, seq, buttons, l2, r2, lx, ly, rx, ry)
+        if len(data) == INPUT_LEN:
+            magic, version, seq, buttons, l2, r2, lx, ly, rx, ry = \
+                INPUT_STRUCT.unpack(data)
+            if magic != INPUT_MAGIC or version != INPUT_VERSION:
+                return None
+            return cls(version, seq, buttons, l2, r2, lx, ly, rx, ry)
+
+        if len(data) == INPUT_MULTI_LEN:
+            (magic, version, seq, buttons, l2, r2, lx, ly, rx, ry,
+             player) = INPUT_MULTI_STRUCT.unpack(data)
+            if magic != INPUT_MAGIC or version != INPUT_VERSION_MULTI:
+                return None
+            if not 0 <= player < INPUT_MAX_PLAYERS:
+                return None
+            return cls(version, seq, buttons, l2, r2, lx, ly, rx, ry, player)
+
+        return None
 
     def pressed_buttons(self):
         return [name for bit, name in BUTTON_NAMES.items() if self.buttons & bit]
@@ -330,6 +365,22 @@ if __name__ == "__main__":
     p = InputPacket(1, 7, BTN_CROSS | BTN_UP, 128, 255, -100, -200, 300, 400)
     q = InputPacket.unpack(p.pack())
     assert q == p, q
+    assert len(p.pack()) == INPUT_LEN          # player 0 stays 18 bytes
+
+    # Multi-player packets: v2 = v1 + a trailing player byte, players 1..3.
+    for player in range(1, INPUT_MAX_PLAYERS):
+        m = InputPacket(1, 9, BTN_CIRCLE, 10, 20, 1, 2, 3, 4, player)
+        wire = m.pack()
+        assert len(wire) == INPUT_MULTI_LEN and wire[18] == player
+        assert InputPacket.unpack(wire) == m
+        # An old receiver only accepts 18-byte v1 packets, so it ignores these.
+        assert len(wire) != INPUT_LEN
+    assert InputPacket.unpack(b"RP4I\x02" + bytes(13)) is None   # truncated
+    assert InputPacket.unpack(b"RP4I\x01" + bytes(13) + b"\x00") is None
+    assert InputPacket.unpack(b"RP4M\x01" + bytes(13)) is None    # bad magic
+    bad = bytearray(InputPacket(1, 1, 0, 0, 0, 0, 0, 0, 0, 2).pack())
+    bad[-1] = INPUT_MAX_PLAYERS                                # player out of range
+    assert InputPacket.unpack(bytes(bad)) is None
     s = StatsPacket(25, 1500, 0, 1234)
     assert StatsPacket.unpack(s.pack()) == s
 

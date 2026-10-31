@@ -13,8 +13,10 @@ translation lives in exactly one place.
 
 import atexit
 import sys
+import time
 
 from protocol import (
+    INPUT_MAX_PLAYERS,
     InputPacket,
     BTN_CROSS, BTN_CIRCLE, BTN_SQUARE, BTN_TRIANGLE,
     BTN_L1, BTN_R1, BTN_L2, BTN_R2,
@@ -215,3 +217,89 @@ class VirtualPad:
 
     def close(self) -> None:
         self._b.close()
+
+
+class VirtualPadSet:
+    """One virtual Xbox 360 pad per RP4I player.
+
+    Pad creation is *ordered*: a pad's XInput index always equals its player
+    number, so seeing player 2 for the first time also creates the (idle) pads
+    for players 0 and 1. Pads are never destroyed while the process runs, which
+    keeps indices stable inside games that enumerate controllers once.
+
+    A pad that stops sending packets (PS4 unplugged, app restarted) is reset
+    after `timeout` seconds by :meth:`tick`, otherwise a button held at the
+    moment of disconnect would stay pressed forever on the PC.
+
+    `factory` and `clock` are injectable so the routing/timeout logic can be
+    unit-tested without uinput or ViGEmBus.
+    """
+
+    def __init__(self, max_players=INPUT_MAX_PLAYERS, factory=None,
+                 clock=time.monotonic, timeout=1.0):
+        if not 1 <= max_players <= INPUT_MAX_PLAYERS:
+            raise ValueError(f"max_players must be 1..{INPUT_MAX_PLAYERS}")
+        self.max_players = int(max_players)
+        self.timeout = float(timeout)
+        self._factory = factory or VirtualPad
+        self._clock = clock
+        self._pads = [None] * self.max_players
+        self._last = [0.0] * self.max_players
+        self._active = [False] * self.max_players
+        self.ensure(0)          # player 1 always exists, like a single pad today
+
+    def ensure(self, player):
+        """Create every pad up to `player`; returns the pad for that player."""
+        for i in range(player + 1):
+            if self._pads[i] is None:
+                self._pads[i] = self._factory()
+        return self._pads[player]
+
+    def apply(self, pkt: InputPacket) -> bool:
+        """Route one packet to its player's pad.
+
+        Returns True when this is the first packet from that player (the caller
+        logs "player N connected"), False otherwise. Out-of-range players and
+        packets beyond `max_players` are dropped without raising.
+        """
+        player = pkt.player
+        if not 0 <= player < self.max_players:
+            return False
+        newly_active = not self._active[player]
+        self.ensure(player)
+        self._pads[player].apply(pkt)
+        self._last[player] = self._clock()
+        self._active[player] = True
+        return newly_active
+
+    def active_players(self):
+        return [i for i, on in enumerate(self._active) if on]
+
+    def tick(self, now=None):
+        """Reset pads that have been silent for `timeout` seconds.
+
+        Returns the list of player indices that just went away.
+        """
+        now = self._clock() if now is None else float(now)
+        gone = []
+        for i, pad in enumerate(self._pads):
+            if pad is None or not self._active[i]:
+                continue
+            if now - self._last[i] >= self.timeout:
+                pad.reset()
+                self._active[i] = False
+                gone.append(i)
+        return gone
+
+    def reset(self) -> None:
+        for pad in self._pads:
+            if pad is not None:
+                pad.reset()
+
+    def close(self) -> None:
+        for i, pad in enumerate(self._pads):
+            if pad is not None:
+                pad.close()
+                self._pads[i] = None
+        self._active = [False] * self.max_players
+        self._last = [0.0] * self.max_players

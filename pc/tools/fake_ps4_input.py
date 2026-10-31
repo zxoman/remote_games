@@ -9,6 +9,7 @@ Usage examples:
     python tools/fake_ps4_input.py --dpad up                # D-pad up
     python tools/fake_ps4_input.py --pattern circle         # move left stick in a circle
     python tools/fake_ps4_input.py --loss 5 --seconds 30    # 5% loss for 30 s
+    python tools/fake_ps4_input.py --player 2 --btn cross   # controller 2
 
 Button names: cross, circle, square, triangle, l1, r1, l2, r2, share, options,
 l3, r3, up, down, left, right
@@ -25,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # pc/
 
 from protocol import (  # noqa: E402
-    InputPacket,
+    INPUT_MAX_PLAYERS, InputPacket,
     BTN_CROSS, BTN_CIRCLE, BTN_SQUARE, BTN_TRIANGLE,
     BTN_L1, BTN_R1, BTN_L2, BTN_R2,
     BTN_SHARE, BTN_OPTIONS, BTN_L3, BTN_R3,
@@ -90,6 +91,9 @@ def main(argv=None):
                     help="PC input port (default 47001)")
     ap.add_argument("--rate", type=float, default=250.0,
                     help="packets per second (default 250)")
+    ap.add_argument("--player", type=int, default=1, metavar="N",
+                    help=f"controller number 1..{INPUT_MAX_PLAYERS} "
+                         "(1 = classic 18-byte packet, default)")
     ap.add_argument("--seconds", type=float, default=0.0,
                     help="stop after N seconds (0 = forever)")
     ap.add_argument("--btn", action="append", default=[],
@@ -128,6 +132,10 @@ def main(argv=None):
     rx, ry = args.stick_r if args.stick_r else (0, 0)
     l2 = args.trigger_l
     r2 = args.trigger_r
+
+    if not 1 <= args.player <= INPUT_MAX_PLAYERS:
+        ap.error(f"--player must be 1..{INPUT_MAX_PLAYERS}")
+    args.player -= 1                    # the wire field is 0-based
 
     loss = max(0.0, min(100.0, args.loss)) / 100.0
     interval = 1.0 / args.rate if args.rate > 0 else 0
@@ -179,6 +187,7 @@ def main(argv=None):
                 ly=ly,
                 rx=rx,
                 ry=ry,
+                player=args.player,
             )
             sock.sendto(pkt.pack(), dest)
             seq = (seq + 1) & 0xFF

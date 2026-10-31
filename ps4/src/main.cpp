@@ -67,12 +67,13 @@ int main(void)
     const uint64_t period_us = 1000000ull / CFG_INPUT_RATE_HZ;
 
     uint8_t seq = 0;
+    int pad_count = 0;
     uint64_t next = now_us();
     uint64_t sent = 0, errors = 0;
     int frame_id = 0;
     int last_lx = 0, last_ly = 0;
 
-    int last_pad_ok = -1;
+    int last_pad_count = -1;
     int ever_rendered = 0;
     int logged_first_frame = 0;
     uint32_t seen_frames = 0;
@@ -88,15 +89,24 @@ int main(void)
         if (now_us() > next + 1000000ull)
             next = now_us(); /* fell far behind; resync */
 
-        /* --- input: read pad + send (highest priority) --- */
-        input_pkt_t pkt;
-        pad_ok = (input_read(&pkt) == 0);
-        last_lx = pkt.lx;
-        last_ly = pkt.ly;
-        pkt.seq = seq++;
+        /* --- input: read every pad + send (highest priority) --- */
+        input_sample_t samples[INPUT_MAX_PLAYERS];
+        int npads = input_poll(samples, INPUT_MAX_PLAYERS);
+        pad_count = input_connected();
+        pad_ok = (pad_count > 0);
+        if (npads > 0) {
+            /* The on-screen marker follows player 1 (slot 0 when present). */
+            last_lx = samples[0].pkt.lx;
+            last_ly = samples[0].pkt.ly;
+        }
 
-        if (udp_ok) {
-            if (udp_send(&input_conn, &pkt, INPUT_PKT_LEN) < 0)
+        for (int i = 0; i < npads; i++) {
+            samples[i].pkt.seq = seq++;
+            uint8_t wire[INPUT_PKT_MULTI_LEN];
+            int len = input_encode(&samples[i], wire, (int)sizeof(wire));
+            if (!udp_ok || len < 0)
+                continue;
+            if (udp_send(&input_conn, wire, (uint16_t)len) < 0)
                 errors++;
             else
                 sent++;
@@ -106,7 +116,7 @@ int main(void)
          *     first frame; capped to ~33 fps so we never flood the flip queue.
          *     Output timestamp is the last recorded value on purpose. --- */
         int new_video = (video_frames() != seen_frames);
-        int status_changed = (pad_ok != last_pad_ok);
+        int status_changed = (pad_count != last_pad_count);
 
         if (have_video && (new_video || status_changed || !ever_rendered) &&
             (t - last_render) >= 30000ull) {
@@ -129,9 +139,12 @@ int main(void)
                 scene->DrawRectangle(cx - 16, cy - 16, 32, 32, Color{230, 230, 230});
             }
 
-            /* Pad status pip, always visible. */
-            Color pip = pad_ok ? Color{0, 220, 0} : Color{220, 0, 0};
-            scene->DrawRectangle(8, 8, 24, 24, pip);
+            /* One status pip per player slot: bright green = pad open. */
+            for (int i = 0; i < INPUT_MAX_PLAYERS; i++) {
+                Color pip = input_player_open(i) ? Color{0, 220, 0}
+                                                 : Color{70, 20, 20};
+                scene->DrawRectangle(8 + i * 20, 8, 16, 16, pip);
+            }
 
             scene->SubmitFlip(frame_id);
             scene->FrameBufferSwap();
@@ -139,18 +152,18 @@ int main(void)
             last_render = t;
 
             if (status_changed && ever_rendered)
-                dlog("pad %s", pad_ok ? "connected" : "disconnected");
+                dlog("pads: %d open", pad_count);
 
-            last_pad_ok = pad_ok;
+            last_pad_count = pad_count;
             ever_rendered = 1;
         }
 
         /* ~1 Hz: one stats line, plus a line whenever frames start dropping. */
         if ((seq & 0xFF) == 0) {
-            dlog("stats sent=%llu err=%llu pad=%s frames=%u drops=%u "
+            dlog("stats sent=%llu err=%llu pads=%d frames=%u drops=%u "
                  "stale=%u inc=%u dec=%u nokey=%u ch=%u starts=%u",
                  (unsigned long long)sent, (unsigned long long)errors,
-                 pad_ok ? "OK" : "MISSING",
+                 pad_count,
                  (unsigned)video_frames(), (unsigned)video_drops(),
                  (unsigned)video_drop_stale(), (unsigned)video_drop_incomplete(),
                  (unsigned)video_drop_decode(), (unsigned)video_drop_nokey(),

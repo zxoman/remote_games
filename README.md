@@ -14,9 +14,9 @@ controls games running on the PC (virtual Xbox 360 pad on the PC).
  └──────────────┘                               └──────────────┘
 ```
 
-**Status: Phase 1 (input), Phase 2 (MJPEG), Phase 3 (H.264) and Steps 1–6
-(weak-network defaults, feedback channel, keyframe-on-demand, adaptive bitrate,
-packet pacing, XOR FEC) implemented.**
+**Status: Phase 1 (input, up to 4 controllers), Phase 2 (MJPEG), Phase 3
+(H.264) and Steps 1–6 (weak-network defaults, feedback channel,
+keyframe-on-demand, adaptive bitrate, packet pacing, XOR FEC) implemented.**
 The video codec is selectable (`codec` in `pc/config.ini`): **auto** (the
 default) picks H.264 when GStreamer can encode it and falls back to MJPEG
 otherwise, so the same config works on Linux and on Windows without GStreamer.
@@ -148,6 +148,8 @@ python receive_input.py            # or --debug for per-packet printout
 - Windows: "Setup USB Game Controllers" (`joy.cpl`)
 - Linux: `evtest /dev/input/eventN` (pick the "Microsoft X-Box 360 pad")
 
+Several DS4s at once work too — see [Multiple controllers](#multiple-controllers).
+
 **No PS4? Test the PC side alone** (terminal 2):
 ```
 cd pc
@@ -162,7 +164,76 @@ the virtual pad and the button mapping:
 python tools/fake_ps4_input.py --btn cross --btn square
 python tools/fake_ps4_input.py --stick-l 32767,0
 python tools/fake_ps4_input.py --pattern circle
+python tools/fake_ps4_input.py --player 2 --btn cross   # controller 2
 ```
+
+## Multiple controllers
+
+The PS4 can stream **up to four DualShock 4 pads**, and the PC turns each one
+into its own virtual Xbox 360 pad, so local co-op works (each game sees N
+separate XInput controllers).
+
+Player 1 keeps the original 18-byte `RP4I` packet, so **an older PC receiver
+still works with a newer PS4** (it just ignores pads 2–4). Players 2–4 send a
+19-byte version-2 packet (same fields + a trailing player byte) which old
+receivers reject on length. Full format and matrix: `docs/protocol.md` §1.
+
+```
+PC:  [virtual pad 1] [virtual pad 2] [virtual pad 3] [virtual pad 4]
+         ▲                ▲
+         │ RP4I v1        │ RP4I v2 (player=1)
+PS4: [DS4 user 1]    [DS4 user 2]   ... up to 4 logged-in users
+```
+
+**Player mapping:** slot *i* on the PS4 is the *i*-th logged-in user (the
+console ties a pad to a user account), and the PC's virtual pad *i* has XInput
+index *i*. Pads are created in order, so controller numbering never shifts when
+a pad connects later.
+
+**Settings:**
+
+* `[input] max_players` in `pc/config.ini` (1–4, default `4`) — how many virtual
+  pads to create. `--players 1` on the command line forces the old single-pad
+  behaviour; `--players 2` makes only players 1–2 work.
+* Nothing to configure on the PS4: it opens every pad slot it can and sends all
+  of them at `CFG_INPUT_RATE_HZ`.
+
+**Disconnects:** the PC resets a pad that has been silent for 1 s (otherwise a
+button held at the moment of disconnect would stay pressed). The PS4 closes a
+slot after the pad reports `connected == 0` for 0.5 s and retries opening it
+every 2 s, so plugging a controller in later just works.
+
+Test with three fake pads, no PS4 (the PC should create **three** virtual
+pads and the 1 Hz line should list all of them):
+
+```bash
+cd pc
+# terminal 1
+python receive_input.py --players 3
+# terminal 2
+python fake_sender.py --players 3
+```
+
+Expected:
+
+```
+listening on udp://0.0.0.0:47001  gamepad=on (3 player(s))
+player 1 connected
+player 2 connected
+player 3 connected
+rate= 750 pkt/s  players=1,2,3  seq_gaps=0  bad=0  last=['cross', 'circle']
+```
+
+Check each pad separately: `evtest` (Linux) or `joy.cpl` (Windows) should show
+three "Microsoft X-Box 360 pad" devices, and moving one fake pad must move only
+its own device. Stopping `fake_sender.py` should print
+`player N timed out (pad reset)` for each pad after ~1 s.
+
+Compatibility test (old sender → new receiver): `fake_sender.py --players 1`
+sends only 18-byte v1 packets and the receiver reports just `players=1`.
+
+`pc/tools/fake_ps4_input.py` also takes `--player N` (1–4) when you want a
+single hand-driven pad instead of the repeating pattern.
 
 ## Running Phase 2 (MJPEG video)
 
@@ -236,6 +307,7 @@ The defaults in `pc/config.ini` now target a weak/unstable Wi-Fi link:
 | `[adaptive] min_fps` | `15` | lowest fps the controller may pick |
 | `pacing_ratio` | `0.6` | spread each frame over 60 % of the frame interval (Step 5) |
 | `fec_group` | `8` | one XOR parity datagram per 8 chunks (+12.5 %, Step 6) |
+| `[input] max_players` | `4` | one virtual Xbox 360 pad per PS4 controller |
 
 **Quality scales (MJPEG only).** `quality` is FFmpeg `-q:v` (**lower = better**,
 2..31) while `wayland_quality` is jpegenc quality (**higher = better**, 0..100).
@@ -689,6 +761,19 @@ binary struct (`RP4I`), little-endian, sent at 250 Hz. Feedback is the additive
     switching the fake to `--loss 0` produced +5 % steps every 5 s. The
     controller reacts to the PS4's real numbers only on hardware — the fake
     models frame loss as `1 - (1 - p)^chunks` (26 chunks per access unit).
+  - **Multi-controller input tested here**: `pc/test_input.py` has 25 pytest
+    cases for the v1/v2 wire format (player 1 stays 18 bytes and byte-identical
+    apart from `version`; players 2–4 are 19 bytes with the player byte last;
+    wrong lengths, magic, version and out-of-range players are rejected) and for
+    `VirtualPadSet` routing (ordered pad creation, per-player apply, the 1 s
+    silence watchdog, `max_players` bounds, close). Live on this machine:
+    `receive_input.py` + `fake_sender.py --players 3` created **three** uinput
+    devices (event19/20/21) and each received only its own player's stick
+    values; the 1 Hz line reported `players=1,2,3`, and stopping the sender
+    produced two `timed out (pad reset)` lines within ~1 s. The **PS4 side
+    (login-user list → pad slot, hot-plug retry, `OrbisPadData.connected`) has
+    not run on hardware** — it compiles and links, but the slot↔user mapping
+    and the `connected` flag still need a real console.
   - **Step 6 (XOR FEC) tested here**: `pc/fec.py` + `pc/test_fec.py` add 40
     pytest cases (group field packing, parity maths with a short final block,
     datagram parsing/rejection, and `FecReceiver` as an executable spec of
