@@ -13,7 +13,7 @@
  * Current setup: PS4 = 192.168.1.14, PC = 192.168.1.16 (DHCP) with .15 added
  * as a secondary address (`ip addr add 192.168.1.15/24 dev eno1`) because the
  * installed PKG was built against .15. */
-#define CFG_PC_IP       "192.168.1.15"
+#define CFG_PC_IP       "192.168.1.17"
 
 /* PC input listener port (matches pc/config.ini [input] listen_port). */
 #define CFG_INPUT_PORT  47001
