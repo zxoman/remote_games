@@ -53,6 +53,7 @@ from protocol import (  # noqa: E402
 )
 from feedback import FeedbackListener  # noqa: E402
 from abr import AdaptiveBitrateController  # noqa: E402
+from pacing import PacketPacer, chunk_count  # noqa: E402
 
 SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
@@ -99,6 +100,9 @@ DEFAULTS = {
     "abr_drop_ratio_high": 0.45,
     "abr_escalate_after": 3,
     "abr_restore_interval": 20.0,
+    # Packet pacing (Step 5): spread one frame's datagrams over this fraction
+    # of the frame interval. 0 = send each frame as one burst (old behaviour).
+    "pacing_ratio": 0.6,
 }
 
 # [adaptive] key -> cfg key. Kept as a mapping so config.ini can use short,
@@ -128,7 +132,7 @@ _INT_KEYS = ("video_port", "width", "height", "fps", "quality", "wayland_quality
 _FLOAT_KEYS = ("abr_loss_high", "abr_loss_low", "abr_decrease_factor",
                "abr_increase_step", "abr_increase_interval", "abr_cooldown",
                "abr_jitter_high_ms", "abr_drop_ratio_high",
-               "abr_restore_interval")
+               "abr_restore_interval", "pacing_ratio")
 
 
 def load_config(path):
@@ -442,6 +446,9 @@ def main(argv=None):
                     help="do not listen for PS4 STATS/KEYFRAME_REQUEST packets")
     ap.add_argument("--feedback-port", type=int, dest="feedback_port",
                     help="UDP port to listen on for PS4 feedback (default 47002)")
+    ap.add_argument("--pacing-ratio", type=float, dest="pacing_ratio",
+                    help="spread a frame's packets over this fraction of the "
+                         "frame interval (0 disables pacing; default 0.6)")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop after N seconds (0 = run forever)")
     ap.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg binary")
@@ -479,6 +486,8 @@ def main(argv=None):
         cfg["h264_complexity"] = args.h264_complexity
     if args.quality_pct is not None:
         cfg["quality_pct"] = args.quality_pct
+    if args.pacing_ratio is not None:
+        cfg["pacing_ratio"] = args.pacing_ratio
     if args.feedback_port is not None:
         cfg["feedback_port"] = args.feedback_port
     if args.no_feedback:
@@ -533,6 +542,21 @@ def main(argv=None):
     else:
         print("[send_mjpeg] --no-send: frames parsed but not transmitted")
 
+    # Step 5: packet pacing. Disabled with --no-send (nothing reaches the
+    # network, so sleeping would only make the local check slower).
+    try:
+        pacer = PacketPacer(cfg["pacing_ratio"], cfg["fps"])
+    except ValueError as e:
+        raise SystemExit(f"[send_mjpeg] pacing_ratio: {e}")
+    pace = pacer.enabled and sock is not None
+    if pace:
+        print(f"[send_mjpeg] pacing: {pacer.describe()} "
+              f"(pacing_ratio = 0 disables)")
+    elif pacer.enabled:
+        print("[send_mjpeg] pacing: off for --no-send")
+    else:
+        print("[send_mjpeg] pacing: disabled (pacing_ratio = 0)")
+
     def spawn_capture(bitrate=None):
         """Start the capture helper.
 
@@ -583,6 +607,7 @@ def main(argv=None):
             print(f"[send_mjpeg] abr: disabled ({e})")
     elif cfg["abr_enabled"]:
         print("[send_mjpeg] abr: only used with codec=h264")
+
     # Seed from the clock so a restart resumes at a *higher* frame_id than the
     # previous run; the PS4 receiver drops any frame_id lower than its current
     # one, so starting from 0 again would wedge it.
@@ -631,7 +656,13 @@ def main(argv=None):
                                 kf_requests_seen += 1
 
                 if sock is not None:
+                    # Step 5: spread this frame's datagrams over part of the
+                    # frame interval instead of handing the kernel one burst.
+                    if pace:
+                        pacer.begin_frame(chunk_count(len(frame)))
                     for dgram in iter_chunks(frame_id & 0xFFFFFFFF, frame, flags):
+                        if pace:
+                            pacer.wait()
                         try:
                             sock.sendto(dgram, dest)
                             sent_pkts += 1
@@ -660,6 +691,9 @@ def main(argv=None):
                     extra = ("" if sock is None else
                              f" pkts/s={(sent_pkts - last_report_pkts) / (now - last_report):.0f}"
                              f" err/s={send_errors - last_report_errs}")
+                    if pace:
+                        extra += (f" pace={pacer.ratio:.2f}"
+                                  f" late={pacer.late_frames}")
                     st = None
                     if fb is not None:
                         st, _ts = fb.latest()
@@ -731,6 +765,7 @@ def main(argv=None):
                   f"(bitrate={abr.target.bitrate})")
             terminate_proc(proc)
             proc = spawn_capture(abr.target.bitrate)
+            pacer.set_fps(cfg["fps"])
             last_restart = time.monotonic()
             last_report = time.time()
             last_report_pkts = sent_pkts
@@ -750,6 +785,8 @@ def main(argv=None):
     print(f"[send_mjpeg] done: {frame_id} frames in {elapsed:.1f}s, "
           f"{sent_pkts} packets, {sent_bytes} bytes, {send_errors} send errors "
           f"({send_drops} frames dropped on a full buffer)")
+    if pace:
+        print(f"[send_mjpeg] {pacer.summary()}")
     if errno_counts:
         import errno as _errno
         pretty = ", ".join(

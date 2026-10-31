@@ -317,3 +317,47 @@ may change resolution mid-session. `ps4/src/video.c` presents whatever
 the largest configured geometry, so a downscaled frame fits; FFmpeg is expected
 to pick up the in-band SPS and rebuild the swscale context, but this needs
 confirmation on hardware (see the `TODO(verify-on-PS4)` in `video.c`).
+
+### 7.6 Packet pacing (Step 5) — PC-local, no wire change
+
+Pacing adds **no packets and changes no header**. The RP4V header in §3/§4 is
+byte-for-byte the same, and chunk indices/counts are unchanged, so an old PS4
+build and a new PC build remain interchangeable.
+
+Only the *timing* of the datagrams changes. With `pacing_ratio = r` (default
+`0.6`, `0` disables), one frame of `n` datagrams is sent over
+
+```
+budget = r / fps            # 20 ms at 30 fps with r = 0.6
+gap    = budget / n         # per-datagram slot
+```
+
+and datagram `i` is handed to the kernel no earlier than
+`frame_start + i * gap`. The receiver never has to wait for the frame any
+longer than `budget` (well inside one frame interval), so buffering on the PS4
+is unaffected: `video.c` already accumulates chunks until `chunk_cnt` of one
+`frame_id` arrive.
+
+Guarantees:
+
+* **No catch-up bursts.** If the clock is already past a slot (slow encode,
+  scheduler hiccup) the datagram is sent immediately and the schedule is
+  re-anchored to `now + gap`; the frame is then counted once in `late_frames`.
+  Pacing cannot add latency, only spread a burst.
+* **Batching, not per-packet syscalls.** Slots closer than ~0.5 ms are merged
+  (a ~250-chunk keyframe sleeps once every few datagrams) while the total time
+  per frame still equals `budget`.
+* **Non-blocking socket.** A full `SO_SNDBUF` still abandons the rest of the
+  access unit (`frames dropped on a full buffer`), exactly as before pacing;
+  `wait()` only decides *when* `sendto()` is called.
+* **fps changes** (ABR restart) immediately update the budget.
+
+Measured on loopback (720p30, ~14.7 KB access units, `--test-pattern`):
+
+| `pacing_ratio` | median per-frame spread | median inter-packet gap | peak vs average |
+|----------------|------------------------|------------------------|-----------------|
+| `0` (off)      | 0.13 ms                | 0.007 ms               | ~1 frame       |
+| `0.6`          | 18.4 ms                | 1.53 ms                | ~1.7×          |
+
+Nothing in this section is PS4-specific; it is implemented once in
+`pc/pacing.py` and driven by the shared send loop, so it also paces MJPEG.

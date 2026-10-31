@@ -14,9 +14,9 @@ controls games running on the PC (virtual Xbox 360 pad on the PC).
  └──────────────┘                               └──────────────┘
 ```
 
-**Status: Phase 1 (input), Phase 2 (MJPEG), Phase 3 (H.264) and Steps 1–4
-(weak-network defaults, feedback channel, keyframe-on-demand, adaptive bitrate)
-implemented.**
+**Status: Phase 1 (input), Phase 2 (MJPEG), Phase 3 (H.264) and Steps 1–5
+(weak-network defaults, feedback channel, keyframe-on-demand, adaptive bitrate,
+packet pacing) implemented.**
 The video codec is selectable (`codec` in `pc/config.ini`): **auto** (the
 default) picks H.264 when GStreamer can encode it and falls back to MJPEG
 otherwise, so the same config works on Linux and on Windows without GStreamer.
@@ -234,6 +234,7 @@ The defaults in `pc/config.ini` now target a weak/unstable Wi-Fi link:
 | `[adaptive] min_bitrate` | `600000` | floor before fps is reduced |
 | `[adaptive] max_bitrate` | `6000000` | ceiling on a healthy link |
 | `[adaptive] min_fps` | `15` | lowest fps the controller may pick |
+| `pacing_ratio` | `0.6` | spread each frame over 60 % of the frame interval (Step 5) |
 
 **Quality scales (MJPEG only).** `quality` is FFmpeg `-q:v` (**lower = better**,
 2..31) while `wayland_quality` is jpegenc quality (**higher = better**, 0..100).
@@ -383,6 +384,83 @@ Expected: the bitrate steps down `2500000 -> 1875000 -> 1406250 -> 1054688 ->
 791016 -> 600000`, then fps/resolution drop only if loss continues, and once
 the link is clean it climbs back by 5 % every 5 s.
 
+## Packet pacing (Step 5)
+
+A 720p30 access unit leaves `openh264enc` as ~20 datagrams (a keyframe as
+~250). Handing that whole burst to the kernel in one `for` loop means the Wi-Fi
+driver queues it all at once: the AP sees a 2–25 Mbit/s spike per frame, and the
+*tail* of that burst is what collides with the next one under load. Packet
+pacing keeps the average bitrate identical and flattens the peak:
+
+```
+frame 0                                 frame 1
+|-- 20 ms budget (ratio 0.6) --|         |-- 20 ms ...
+ ^ ^ ^ ^ ^ ... ^  (one datagram every ~1 ms, 13 ms idle)
+```
+
+`pc/pacing.py` (`PacketPacer`) is pure apart from injected `clock`/`sleep`
+callables, so it is unit-tested on a virtual clock. `send_mjpeg.py` drives it:
+
+* `pacing_ratio` (`[video]`, or `--pacing-ratio`) = the fraction of the frame
+  interval used to send one frame. `0` disables pacing (the old one-burst
+  behaviour); **0.5–0.7 is the useful range**; `0.6` (20 ms at 30 fps) is the
+  default. Values outside 0..1 are rejected at startup.
+* Gaps below 0.5 ms are batched — a 250-datagram keyframe gets one `sleep` per
+  few packets instead of 250 syscalls — but the frame as a whole still takes
+  its full budget.
+* If the sender is already past a packet's slot it **does not burst to catch
+  up**: it sends immediately and re-anchors, and counts the frame in
+  `late_frames`. Pacing can therefore never add latency, only spread the
+  packets.
+* The socket stays **non-blocking** and a full send buffer still abandons the
+  rest of the access unit (`frames dropped on a full buffer`). Pacing only
+  decides *when* a datagram is handed to the kernel, never whether to block.
+* An ABR fps change updates the pacer (`set_fps`) so the budget follows
+  30 → 20 → 15 fps. `--no-send` skips pacing entirely.
+
+The 1 Hz line gains `pace=0.60 late=N`, and the final summary reports frames,
+packets, sleeps and total time slept:
+
+```
+[send_mjpeg] pacing: 0.60 of the frame interval (20.0 ms at 30 fps) (pacing_ratio = 0 disables)
+[send_mjpeg] frame=... 30.0 fps ... pkts/s=425 err/s=0 pace=0.60 late=0 ...
+[send_mjpeg] pacing: ratio=0.60 (20.0 ms/frame at 30 fps), 113 frames, 1540 packets, 1530 sleeps, 2.0s slept, 0 late frames
+```
+
+Verify it on the PC alone (no PS4): run a UDP listener on 9025 and compare the
+spread of each frame's datagrams with pacing on and off.
+
+```bash
+cd pc
+# terminal 1: measure per-frame spread
+python3 - <<'EOF'
+import socket, struct, time
+H = struct.Struct("<4sBBHHIH"); s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", 9025)); s.settimeout(5)
+first, last = {}, {}
+t_end = time.monotonic() + 5
+while time.monotonic() < t_end:
+    try: d, _ = s.recvfrom(2048)
+    except socket.timeout: break
+    magic, ver, fl, idx, cnt, fid, ln = H.unpack_from(d)
+    if magic != b"RP4V": continue
+    n = time.monotonic(); first.setdefault(fid, n); last[fid] = n
+sp = sorted((last[f] - first[f]) * 1000 for f in first if len(first) > 0)
+print(f"frames={len(sp)} median spread={sp[len(sp)//2]:.2f} ms")
+EOF
+
+# terminal 2
+python3 send_mjpeg.py --test-pattern --host 127.0.0.1 --no-feedback --duration 5
+python3 send_mjpeg.py --test-pattern --host 127.0.0.1 --no-feedback --duration 5 --pacing-ratio 0
+```
+
+Measured on this machine (loopback, 720p30, ~14.7 KB access units):
+
+| Setting | median frame spread | median inter-packet gap |
+|---------|--------------------|------------------------|
+| `pacing_ratio = 0` | **0.13 ms** (one burst) | 0.007 ms |
+| `pacing_ratio = 0.6` | **18.4 ms** | 1.53 ms |
+
 ## Viewing the PS4 log
 
 The app's `printf` is **not** visible on its own. Instead it logs through
@@ -479,6 +557,17 @@ binary struct (`RP4I`), little-endian, sent at 250 Hz. Feedback is the additive
     is used when present, with a hand-built `GstForceKeyUnit` fallback. The
     intra-refresh fallback path was exercised and logs correctly. PS4-side
     request generation is still unverified on hardware.
+  - **Step 5 (packet pacing) tested here**: `pc/pacing.py` has 21 pytest cases
+    on a virtual clock (budget arithmetic, batching of sub-millisecond gaps,
+    late frames are sent immediately and counted once, per-frame re-anchoring,
+    ratio validation, chunk-count parity with `iter_chunks`). End-to-end on
+    loopback with a timestamping UDP listener: the median spread of one frame's
+    datagrams went from **0.13 ms** (pacing off) to **18.4 ms** (ratio 0.6, a
+    20 ms budget), with the same packet count and byte count; a full run with
+    `fake_ps4_stats.py --loss 8` kept pacing through live bitrate changes and
+    the 30→20→15 fps restarts (`late=0` at 30 fps, no send errors). What this
+    cannot show is the benefit on real Wi-Fi: the airtime improvement needs the
+    PS4 on a congested AP.
   - **Step 4 (ABR) tested here**: `pc/abr.py` has 28 pytest cases (decrease,
     cooldown, hysteresis, +5 % recovery, clamps, jitter/drop triggers, the
     fps→resolution ladder, the restore gate, no oscillation). Live bitrate
@@ -489,7 +578,7 @@ binary struct (`RP4I`), little-endian, sent at 250 Hz. Feedback is the additive
     **5.1 s apart**, each keeping the ABR bitrate and a monotonic `frame_id`;
     switching the fake to `--loss 0` produced +5 % steps every 5 s. The
     controller reacts to the PS4's real numbers only on hardware — the fake
-    models frame loss as `loss × 1.5`.
+    models frame loss as `1 - (1 - p)^chunks` (26 chunks per access unit).
 - Container build artifacts were produced with clang 22 / lld 22 (Alpine) and
   packaged with the toolchain's own `PkgTool.Core` (Ubuntu 20.04 for OpenSSL
   1.1). Your OpenOrbis version may differ; if the sample Makefile flags change,
