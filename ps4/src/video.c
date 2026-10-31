@@ -65,6 +65,25 @@ static volatile uint32_t g_chunks;         /* unique chunks accepted */
 static volatile uint32_t g_starts;         /* frames begun */
 static uint32_t          g_stale_streak;   /* consecutive stale chunks seen */
 
+/* --- Step 6: XOR FEC parity state (receive thread only) ------------------ */
+#define FEC_MAX_PARITY 128  /* 128 * 1200 B ~= 150 KB; see docs/protocol.md §7.7 */
+typedef struct {
+    uint32_t frame_id;
+    uint16_t start;     /* first chunk index covered */
+    uint16_t len;       /* number of chunks covered */
+    uint16_t span;      /* parity bytes carried */
+    uint16_t last_len;  /* true length of the frame's final chunk (0 = n/a) */
+    uint8_t  data[VIDEO_CHUNK_PAYLOAD];
+} fec_parity_t;
+
+static fec_parity_t     *g_fec;
+static int               g_fec_count;
+static volatile uint32_t g_recovered;      /* chunks rebuilt by FEC */
+static uint32_t          g_fec_frames;     /* frames rescued by FEC */
+static uint32_t          g_logged_recovered;
+
+static void try_decode(void);   /* defined below; used by fec_try_recover path */
+
 /* --- Feedback channel (Step 2): STATS + KEYFRAME_REQUEST -> PC ---------- */
 static udp_conn_t       g_fb;
 static int              g_fb_ok;
@@ -157,6 +176,7 @@ static void start_frame(uint32_t fid, uint16_t cnt, uint8_t flags)
     g_complete = 0;
     g_decoded = 0;
     g_stale_streak = 0;
+    g_fec_count = 0;                /* parity never carries over to a frame */
     g_starts++;
     g_pkts_expected += cnt;
 }
@@ -171,6 +191,102 @@ static void mark_chunk(uint16_t idx)
     g_seen[idx >> 3] |= (uint8_t)(1u << (idx & 7));
 }
 
+/*
+ * Step 6: stash one parity datagram. Only the frame currently being
+ * reassembled can use it, and only the first copy of a group is kept.
+ */
+static void handle_parity(const video_hdr_t *h, const uint8_t *d, int n)
+{
+    if (h->payload_len == 0 || h->payload_len > VIDEO_CHUNK_PAYLOAD ||
+        VIDEO_HDR_LEN + (int)h->payload_len > n)
+        return;
+    if (h->chunk_cnt < VIDEO_FEC_CCNT || h->chunk_cnt > VIDEO_FEC_CCNT_MAX)
+        return;
+
+    uint16_t start;
+    uint8_t  len;
+    if (video_fec_group_decode(h->chunk_idx, &start, &len) != 0)
+        return;
+
+    if (!g_have_frame || g_complete || h->frame_id != g_meta.frame_id)
+        return;                             /* parity for a frame we moved past */
+    if (!g_fec || g_fec_count >= FEC_MAX_PARITY)
+        return;
+    for (int i = 0; i < g_fec_count; i++)
+        if (g_fec[i].start == start)
+            return;
+
+    fec_parity_t *p = &g_fec[g_fec_count++];
+    p->frame_id = h->frame_id;
+    p->start = start;
+    p->len = len;
+    p->span = h->payload_len;
+    p->last_len = (uint16_t)(h->chunk_cnt - VIDEO_FEC_CCNT);
+    memset(p->data, 0, sizeof(p->data));
+    memcpy(p->data, d + VIDEO_HDR_LEN, h->payload_len);
+}
+
+/*
+ * Step 6: rebuild every group that is missing exactly one chunk.
+ *
+ * Called when a newer frame starts, i.e. when this one can no longer be
+ * completed by late datagrams. Returns the number of chunks recovered.
+ */
+static int fec_try_recover(void)
+{
+    if (!g_have_frame || g_complete || !g_fec || g_fec_count == 0)
+        return 0;
+
+    int fixed = 0;
+    uint16_t cnt = g_meta.chunk_cnt;
+
+    for (int k = 0; k < g_fec_count; k++) {
+        fec_parity_t *p = &g_fec[k];
+        if (p->frame_id != g_meta.frame_id)
+            continue;
+        if ((uint32_t)p->start + p->len > cnt)
+            continue;                       /* group runs past this frame */
+
+        int missing = -1, holes = 0;
+        for (uint16_t i = p->start; i < (uint16_t)(p->start + p->len); i++) {
+            if (!chunk_seen(i)) {
+                if (++holes > 1)
+                    break;
+                missing = (int)i;
+            }
+        }
+        if (holes != 1)
+            continue;                       /* nothing to do, or two losses */
+
+        uint8_t *dst = g_frame + (size_t)missing * VIDEO_CHUNK_PAYLOAD;
+        memcpy(dst, p->data, sizeof(p->data));
+        for (uint16_t i = p->start; i < (uint16_t)(p->start + p->len); i++) {
+            if ((int)i == missing)
+                continue;
+            const uint8_t *src = g_frame + (size_t)i * VIDEO_CHUNK_PAYLOAD;
+            uint16_t clen = g_meta.clen[i];
+            if (clen > VIDEO_CHUNK_PAYLOAD)
+                clen = VIDEO_CHUNK_PAYLOAD;
+            /* Only the bytes that were actually sent participate in the XOR;
+             * the rest of the block is implicit zero padding. */
+            for (uint16_t b = 0; b < clen; b++)
+                dst[b] ^= src[b];
+        }
+
+        uint16_t rl = VIDEO_CHUNK_PAYLOAD;
+        if (p->last_len && (uint16_t)missing == (uint16_t)(cnt - 1))
+            rl = p->last_len;               /* length only the sender knew */
+        g_meta.clen[missing] = rl;
+        mark_chunk((uint16_t)missing);
+        g_got++;
+        fixed++;
+    }
+
+    if (fixed > 0)
+        g_fec_frames++;
+    return fixed;
+}
+
 static void handle_datagram(const uint8_t *d, int n)
 {
     if (n < VIDEO_HDR_LEN)
@@ -181,6 +297,12 @@ static void handle_datagram(const uint8_t *d, int n)
 
     if (h.magic != VIDEO_MAGIC || h.version != VIDEO_VERSION)
         return;
+
+    /* Step 6: parity datagrams never become data chunks. */
+    if (h.flags & VIDEO_FLAG_FEC_PARITY) {
+        handle_parity(&h, d, n);
+        return;
+    }
 
     uint16_t cidx = h.chunk_idx;
     uint16_t ccnt = h.chunk_cnt;
@@ -196,13 +318,23 @@ static void handle_datagram(const uint8_t *d, int n)
         int32_t delta = (int32_t)(h.frame_id - (g_have_frame ? g_meta.frame_id : 0));
         if (!g_have_frame || delta > 0) {
             if (g_have_frame && !g_complete) {
-                g_drops++;
-                g_drop_incomplete++; /* never finished the previous frame */
-                /* A gap breaks H.264 reference chains: wait for the next IDR
-                 * and ask the encoder for one right away. */
-                if (g_meta.flags & VIDEO_FLAG_H264) {
-                    g_wait_keyframe = 1;
-                    request_keyframe(FB_KF_REASON_INCOMPLETE);
+                /* Step 6: last chance to rescue this frame with parity before
+                 * the new one overwrites the reassembly buffer. */
+                int fixed = fec_try_recover();
+                if (fixed > 0 && g_got == g_meta.chunk_cnt) {
+                    g_complete = 1;
+                    g_recovered += (uint32_t)fixed;
+                    if (!g_decoded)
+                        try_decode();
+                } else {
+                    g_drops++;
+                    g_drop_incomplete++; /* never finished the previous frame */
+                    /* A gap breaks H.264 reference chains: wait for the next
+                     * IDR and ask the encoder for one right away. */
+                    if (g_meta.flags & VIDEO_FLAG_H264) {
+                        g_wait_keyframe = 1;
+                        request_keyframe(FB_KF_REASON_INCOMPLETE);
+                    }
                 }
             }
             start_frame(h.frame_id, ccnt, h.flags);
@@ -351,6 +483,15 @@ static void *recv_thread(void *arg)
         if (now_us - g_last_stats_us >= 1000000) {
             send_stats();
             g_last_stats_us = now_us;
+            /* Step 6: surface FEC activity in the PC log (rate-limited to 1 Hz
+             * so a bad link cannot flood dlog). */
+            if (g_recovered != g_logged_recovered) {
+                uint32_t delta = g_recovered - g_logged_recovered;
+                g_logged_recovered = g_recovered;
+                dlog("fec: recovered %u chunk(s) this second, %u total in "
+                     "%u frame(s)", (unsigned)delta, (unsigned)g_recovered,
+                     (unsigned)g_fec_frames);
+            }
         }
 
         if (idle)
@@ -364,6 +505,12 @@ int video_start(uint16_t port, int max_w, int max_h)
     g_rgb_cap = max_w * max_h * 3;
 
     g_frame = (uint8_t *)malloc((size_t)VIDEO_MAX_CHUNKS * VIDEO_CHUNK_PAYLOAD);
+    /* Step 6: parity slots. Allocation failure only costs FEC, not video. */
+    g_fec = (fec_parity_t *)calloc(FEC_MAX_PARITY, sizeof(fec_parity_t));
+    g_fec_count = 0;
+    g_recovered = 0;
+    g_fec_frames = 0;
+    g_logged_recovered = 0;
     g_rgb[0] = (uint8_t *)calloc(1, g_rgb_cap);
     g_rgb[1] = (uint8_t *)calloc(1, g_rgb_cap);
     g_dec = jpeg_decoder_create();
@@ -376,7 +523,8 @@ int video_start(uint16_t port, int max_w, int max_h)
              (void *)g_dec, g_rgb_cap);
         return -1;
     }
-    dlog("vstart: jpeg=%p h264=%p cap=%d", (void *)g_dec, (void *)g_h264, g_rgb_cap);
+    dlog("vstart: jpeg=%p h264=%p cap=%d fec=%p", (void *)g_dec, (void *)g_h264,
+         g_rgb_cap, (void *)g_fec);
 
     int rc = udp_open_listen(&g_sock, port);
     if (rc != 0) {
@@ -441,6 +589,10 @@ void video_stop(void)
     if (g_h264) {
         h264_decoder_destroy(g_h264);
         g_h264 = NULL;
+    }
+    if (g_fec) {
+        free(g_fec);
+        g_fec = NULL;
     }
 }
 

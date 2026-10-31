@@ -127,6 +127,7 @@ Chunked datagrams, PC → PS4 port 9025.
 |-----|----------------------|---------|
 | 0   | `VIDEO_FLAG_KEYFRAME`| MJPEG: always set. H.264: the access unit contains an IDR slice and is a safe resync point. |
 | 1   | `VIDEO_FLAG_H264`    | Payload is H.264 (Annex-B access unit), not JPEG. |
+| 2   | `VIDEO_FLAG_FEC_PARITY` | Step 6: this datagram is an XOR parity block, not frame data. See §7.7. |
 
 One "frame" on the wire is one JPEG image (Phase 2) or one H.264 **access unit**
 (Phase 3). H.264 requires the receiver to hold decoder state across frames and to
@@ -142,8 +143,11 @@ offset `N × 1184` in the frame buffer, and the frame length is
 matter; all chunks of a frame carry the same `chunk_cnt`.
 
 Receiver drops the whole frame if: any chunk is missing when a newer `frame_id`
-starts arriving, a chunk's `chunk_cnt` disagrees, or `chunk_idx ≥ chunk_cnt`.
-Duplicate chunks (same `frame_id`, same `chunk_idx`) are ignored. The PC sender
+starts arriving (after one Step 6 recovery attempt, §7.7), a chunk's
+`chunk_cnt` disagrees, or `chunk_idx ≥ chunk_cnt`. Duplicate chunks (same
+`frame_id`, same `chunk_idx`) are ignored. A `chunk_cnt` of 0 or greater than
+2048 is never valid for a data chunk; Step 6 uses that to keep parity
+datagrams invisible to receivers that predate it. The PC sender
 is implemented in `pc/send_mjpeg.py` (capture via `grab_wayland.py` /
 `grab_h264.py`); the PS4 receiver in `ps4/src/video.c` (reassembly + codec
 dispatch) with `ps4/src/jpeg_dec.c` (libjpeg-turbo) and `ps4/src/h264_dec.c`
@@ -361,3 +365,115 @@ Measured on loopback (720p30, ~14.7 KB access units, `--test-pattern`):
 
 Nothing in this section is PS4-specific; it is implemented once in
 `pc/pacing.py` and driven by the shared send loop, so it also paces MJPEG.
+
+### 7.7 XOR FEC (Step 6) — new datagram type, old receivers unaffected
+
+FEC adds one **parity datagram** per group of `fec_group` data datagrams
+(`fec_group = 8` by default, `0` disables). It costs `1 / fec_group` extra
+bandwidth (+12.5 % at 8) and lets the PS4 rebuild any *single* lost datagram of
+a group instead of losing the whole access unit — an H.264 frame is
+all-or-nothing, so on a 1 % loss link ~23 % of 26-datagram frames used to die.
+
+```
+P  = D0 ^ D1 ^ ... ^ D(G-1)                  element-wise, zero padded to 1184 B
+Di = P ^ (every present Dj, j != i)          one hole per group
+```
+
+#### Wire format
+
+No new magic, no new version, no larger datagram: a parity datagram reuses the
+16-byte RP4V header from §3.
+
+| Field       | Value |
+|-------------|-------|
+| `magic`     | `RP4V` |
+| `version`   | `0x01` |
+| `flags`     | `VIDEO_FLAG_FEC_PARITY` (`0x04`) set; bit0/bit1 mirror the frame it protects |
+| `chunk_idx` | `(group_start & 0x7FF) | ((group_len - 1) << 11)` — 11 bits start, 4 bits length |
+| `chunk_cnt` | `2049 + last_len`; `last_len` is 0 except for the group holding the frame's final chunk |
+| `frame_id`  | the frame this parity protects |
+| `payload_len` | `span`, the parity bytes carried (1..1184) |
+| payload     | the XOR block |
+
+* `group_len` is 1..16, so the last group of a frame is simply shorter.
+* `span` is the longest block in the group — 1184 whenever the group has a full
+  chunk, less only when it holds nothing but the short final chunk. XOR parity
+  is element-wise, so it is always one block, never `group_len` blocks.
+* `chunk_cnt - 2049` carries the true byte length of the frame's **last** chunk.
+  That length is the one thing the receiver cannot infer when the final chunk
+  is the lost one; without it the decoder would be fed up to 1183 padding bytes.
+* Parity is emitted right after the last data chunk of its group, so a receiver
+  needs no reordering buffer: by the time it arrives, the group is known.
+
+#### Compatibility (why an old PKG keeps working)
+
+`2049` and above is **never** a valid data chunk (`VIDEO_MAX_CHUNKS = 2048`), and
+every receiver already rejects those datagrams:
+
+```c
+if (ccnt == 0 || ccnt > VIDEO_MAX_CHUNKS) return;   /* ps4/src/video.c */
+if (cidx >= ccnt) return;
+```
+
+so a pre-Step-6 PKG receives the parity datagrams and silently discards them. It
+loses 1/8 more bandwidth but behaves exactly as before — same recovery rules,
+same STATS. The reverse also holds: a new PS4 build with an old PC sender sees
+no parity and simply never recovers anything. `fec_group = 0` emits the Step 5
+datagram stream byte-for-byte.
+
+#### Receiver rules (mirrored in `pc/fec.py: FecReceiver`)
+
+1. A datagram whose `flags` has `VIDEO_FLAG_FEC_PARITY` never becomes a data
+   chunk; it is stored (first copy of `group_start` only) in a bounded table
+   (`FEC_MAX_PARITY = 128` groups per frame, ~150 KB).
+2. Parity that arrives for a frame that is already complete, or for a
+   `frame_id` other than the one being reassembled, is dropped — it can no
+   longer be used.
+3. Recovery happens **once per frame, at the frame boundary**: when a newer
+   `frame_id` starts arriving, every stored group with exactly one hole is
+   rebuilt. Then, if all `chunk_cnt` chunks are present, the frame is decoded;
+   otherwise it is dropped as before (incomplete counter, keyframe request).
+4. A recovered chunk is counted in `g_recovered` (logged at 1 Hz through the
+   debug channel), **not** in `packets_received`. That counter must keep
+   meaning "datagrams that actually arrived", otherwise the ABR would lose its
+   one honest loss signal.
+5. Groups with two or more holes are left alone; recovering one of them is
+   impossible with single-parity XOR.
+
+Recovery is attempted only at the boundary because the FEC table is bounded and
+the previous frame's buffer must not be clobbered while it is still being
+filled; a frame that is missing a chunk anyway cannot be shown earlier.
+
+#### ABR interaction
+
+`fec_group` is a sender-side knob, so changing it needs no restart and no
+wire-level handshake. The controller in `pc/abr.py` treats it like the bitrate:
+
+| Condition | `fec_group` |
+|-----------|-------------|
+| loss > `loss_threshold` / jitter / drop ratio ("bad") | `fec_group_bad = 4` (+25 %) |
+| loss < `loss_recover` for a while ("good") | `fec_group_good = 8` (+12.5 %) |
+| inside the hysteresis band | unchanged |
+
+A pure FEC change returns `None` from `update()`; the send loop polls
+`abr.target.fec_group` every frame, so it takes effect on the next access unit
+(`pkts/s` in the 1 Hz line). Parity overhead is **on top of** `h264_bitrate`;
+the encoder is not told to slow down, so a bad link pays `bitrate × (1 + 1/G)`.
+
+#### Measured (loopback, 720p30, 14.4k datagrams over 5 s, 4.5 % simulated loss)
+
+| `fec_group` | datagrams | parity | damaged frames | rescued | still lost | overhead |
+|-------------|-----------|--------|----------------|---------|------------|----------|
+| `0`         | 1984      | 0      | 63 / 144       | 0       | 63 (43.8 %) | 0 %     |
+| `8`         | 2286      | 287    | 61 / 144       | 49      | 12 (8.3 %)  | +12.5 % |
+| `4`         | 2583      | 580    | 72 / 144       | 63      | 9 (6.3 %)   | +25 %   |
+| `2`         | 3044      | 1013   | 72 / 144       | 64      | 8 (5.6 %)   | +51 %   |
+
+Group 8 removes ~80 % of the frame losses for 12.5 % bandwidth; going below 4
+buys little because two losses inside a 2-datagram group are as likely as one.
+That is why the ABR stops at 4.
+
+Nothing in this section is PS4-specific: `pc/fec.py` holds the encoder, the
+parser and the reference receiver, and the same rules live in
+`ps4/src/video.c` (`handle_parity`, `fec_try_recover`) and
+`ps4/include/video_proto.h`.

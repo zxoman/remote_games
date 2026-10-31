@@ -42,14 +42,9 @@ Behaviour
 
 import time
 
-from protocol import VIDEO_CHUNK_PAYLOAD
+from protocol import chunk_count  # noqa: F401  (re-exported for callers)
 
-
-def chunk_count(nbytes):
-    """Datagrams needed for a payload (same formula as ``iter_chunks``)."""
-    if nbytes <= 0:
-        return 0
-    return (nbytes + VIDEO_CHUNK_PAYLOAD - 1) // VIDEO_CHUNK_PAYLOAD
+__all__ = ["PacketPacer", "chunk_count"]
 
 
 class PacketPacer:
@@ -122,13 +117,14 @@ class PacketPacer:
             return 0.0
         now = self._clock()
         delay = self._deadline - now
-        self._deadline += self._gap
         self.packets += 1
 
         if delay <= 0:
-            # Behind schedule (slow frame, hiccup): do not burst to catch up,
-            # just re-anchor and send now.
-            if not self._late:
+            # Already past this slot when we got here: the frame is behind
+            # schedule. Do not burst to catch up — re-anchor and send now.
+            # Only a real stall (> one min_sleep) is reported; the few
+            # microseconds of normal loop jitter are not interesting.
+            if -delay >= self.min_sleep and not self._late:
                 self._late = True
                 self.late_frames += 1
             self._deadline = now + self._gap
@@ -138,8 +134,15 @@ class PacketPacer:
             self._sleep(delay)
             self.slept_s += delay
             self.sleeps += 1
-            return delay
-        return 0.0
+
+        self._deadline += self._gap
+        now = self._clock()
+        if self._deadline <= now:
+            # The sleep overshot (kernel granularity) or the loop body was
+            # slow. Re-anchor instead of carrying the debt, otherwise every
+            # overshoot would push the rest of the frame further behind.
+            self._deadline = now + self._gap
+        return delay
 
     # -- reporting -------------------------------------------------------
     def summary(self):

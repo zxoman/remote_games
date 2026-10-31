@@ -112,6 +112,7 @@ VIDEO_MAGIC = b"RP4V"
 VIDEO_VERSION = 1
 VIDEO_FLAG_KEYFRAME = 0x01  # H.264: access unit contains an IDR slice
 VIDEO_FLAG_H264 = 0x02      # payload is H.264, not JPEG
+VIDEO_FLAG_FEC_PARITY = 0x04  # Step 6: XOR parity datagram, not a data chunk
 
 # magic, version, flags, chunk_idx, chunk_cnt, frame_id, payload_len
 VIDEO_HDR_STRUCT = struct.Struct("<4sBBHHIH")
@@ -123,6 +124,9 @@ VIDEO_CHUNK_PAYLOAD = VIDEO_MAX_DGRAM - VIDEO_HDR_LEN  # 1184
 
 # Keep in sync with ps4/include/video_proto.h (max chunks the receiver buffers).
 VIDEO_MAX_CHUNKS = 2048
+
+# Step 6: largest XOR group the wire format can describe (4 bits of length).
+VIDEO_FEC_GROUP_MAX = 16
 
 
 @dataclass
@@ -139,6 +143,13 @@ class VideoHeader:
             VIDEO_MAGIC, self.version, self.flags,
             self.chunk_idx, self.chunk_cnt, self.frame_id, self.payload_len,
         )
+
+
+def chunk_count(nbytes: int) -> int:
+    """Datagrams needed to carry `nbytes` (same formula as `iter_chunks`)."""
+    if nbytes <= 0:
+        return 0
+    return (nbytes + VIDEO_CHUNK_PAYLOAD - 1) // VIDEO_CHUNK_PAYLOAD
 
 
 def iter_chunks(frame_id: int, payload: bytes, flags: int = VIDEO_FLAG_KEYFRAME):
@@ -304,6 +315,11 @@ def parse_chunk(data: bytes):
     if magic != VIDEO_MAGIC or ver != VIDEO_VERSION:
         return None
     if plen == 0 or VIDEO_HDR_LEN + plen > len(data):
+        return None
+    # chunk_cnt == 0 is never a real chunk: Step 6 puts the FEC group in
+    # chunk_idx and zeroes chunk_cnt so a non-FEC receiver ignores parity
+    # datagrams instead of mistaking them for data (see ps4/src/video.c).
+    if ccnt == 0 or ccnt > VIDEO_MAX_CHUNKS:
         return None
     payload = data[VIDEO_HDR_LEN:VIDEO_HDR_LEN + plen]
     return VideoHeader(ver, flags, cidx, ccnt, fid, plen), payload

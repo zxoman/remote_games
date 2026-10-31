@@ -12,20 +12,21 @@ from protocol import VIDEO_CHUNK_PAYLOAD, iter_chunks
 
 
 class FakeClock:
-    def __init__(self, start=1000.0):
+    def __init__(self, start=1000.0, overshoot=0.0):
         self.t = start
         self.calls = []
+        self.overshoot = overshoot
 
     def __call__(self):
         return self.t
 
     def sleep(self, seconds):
         self.calls.append(seconds)
-        self.t += seconds
+        self.t += seconds + self.overshoot
 
 
-def make(ratio=0.6, fps=30, start=1000.0, **kw):
-    clock = FakeClock(start)
+def make(ratio=0.6, fps=30, start=1000.0, overshoot=0.0, **kw):
+    clock = FakeClock(start, overshoot)
     return clock, PacketPacer(ratio, fps, clock=clock, sleep=clock.sleep, **kw)
 
 
@@ -173,3 +174,38 @@ def test_summary_mentions_the_ratio_and_frame():
     assert "ratio=0.60" in text
     assert "20.0 ms/frame" in text
     assert "10 packets" in text
+
+
+# --- sleep granularity ----------------------------------------------------
+
+def test_sleep_overshoot_does_not_count_as_late():
+    clock, p = make(ratio=0.6, fps=30, overshoot=0.00012)
+    start = clock.t
+    n = 20
+    p.begin_frame(n)
+    for _ in range(n):
+        p.wait()
+    assert p.late_frames == 0
+    # Re-anchoring after each overshoot means the frame costs
+    # budget + one overshoot, not budget + n * overshoot.
+    assert clock.t - start == pytest.approx(0.020 + 0.00012, abs=1e-4)
+
+
+def test_micro_jitter_is_not_reported_as_late():
+    clock, p = make(ratio=0.6, fps=30)
+    gap = p.begin_frame(20)
+    clock.t += gap + 0.0002               # late by less than min_sleep
+    assert p.wait() == 0.0
+    assert p.late_frames == 0
+
+
+def test_a_real_stall_mid_frame_is_reported_once():
+    clock, p = make(ratio=0.6, fps=30)
+    p.begin_frame(20)
+    p.wait()
+    clock.t += 0.010                      # 10 ms hiccup
+    p.wait()
+    assert p.late_frames == 1
+    for _ in range(18):
+        p.wait()
+    assert p.late_frames == 1

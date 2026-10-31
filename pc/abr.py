@@ -42,6 +42,7 @@ class AbrTarget:
     fps: int
     width: int
     height: int
+    fec_group: int = 0      # Step 6: XOR parity datagrams per group (0 = off)
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,9 @@ class AdaptiveBitrateController:
         drop_ratio_high=0.45,
         escalate_after=3,
         restore_interval_s=20.0,
+        fec_group=0,
+        fec_group_bad=4,
+        fec_group_good=8,
         fps_ladder=(30, 20, 15),
         resolution_ladder=((1280, 720), (960, 540), (640, 360)),
     ):
@@ -106,6 +110,11 @@ class AdaptiveBitrateController:
             raise ValueError("loss_low must be below loss_high (hysteresis)")
         if escalate_after < 1:
             raise ValueError("escalate_after must be >= 1")
+        for name, value in (("fec_group", fec_group),
+                            ("fec_group_bad", fec_group_bad),
+                            ("fec_group_good", fec_group_good)):
+            if not 0 <= int(value) <= 16:
+                raise ValueError(f"{name} must be 0..16 (0 = FEC off)")
 
         self.min_bitrate = min_bitrate
         self.max_bitrate = max_bitrate
@@ -125,6 +134,13 @@ class AdaptiveBitrateController:
         self.drop_ratio_high = float(drop_ratio_high)
         self.escalate_after = int(escalate_after)
         self.restore_interval_s = float(restore_interval_s)
+        # Step 6: FEC strength follows the same bad/good classification as the
+        # bitrate, so a lossy sample tightens the parity ratio immediately
+        # (+25 % overhead at group 4 instead of +12.5 % at group 8).
+        self.fec_enabled = int(fec_group) > 0
+        self.fec_bad = int(fec_group_bad) or int(fec_group) or 8
+        self.fec_good = int(fec_group_good) or int(fec_group) or 8
+        self.last_fec_reason = ""
 
         # FPS ladder: highest first, never below min_fps or above start_fps.
         ladder = sorted({self.start_fps, *(int(f) for f in fps_ladder)},
@@ -141,7 +157,7 @@ class AdaptiveBitrateController:
         self._res_ladder = res
 
         self.target = AbrTarget(self.start_bitrate, self.start_fps,
-                                self.width, self.height)
+                                self.width, self.height, int(fec_group))
         self.last_reason = ""
 
         self._last_time = None
@@ -258,6 +274,25 @@ class AdaptiveBitrateController:
                 # Hysteresis band: neither increase nor restore quality.
                 self._good_s = 0.0
                 self._stable_s = 0.0
+
+        # 0. Step 6: steer the FEC group. This is a sender-side parameter, so
+        # it needs no restart and can change on the same sample as the bitrate.
+        if self.fec_enabled:
+            want = self.target.fec_group
+            if bad:
+                want = self.fec_bad
+            elif good:
+                want = self.fec_good
+            if want != self.target.fec_group:
+                old = self.target.fec_group
+                self.target = replace(self.target, fec_group=want)
+                self.last_fec_reason = (
+                    (_stress_reason(loss_pct, self.loss_high, jitter_ms,
+                                    self.jitter_high_ms, drop_ratio,
+                                    self.drop_ratio_high) if bad
+                     else f"link clean ({loss_pct:.1f}% loss)")
+                    + f": fec group {old}->{want}")
+                self.last_reason = self.last_fec_reason
 
         # 1. Multiplicative decrease while above the bitrate floor.
         if bad and self.target.bitrate > self.min_bitrate:

@@ -14,9 +14,9 @@ controls games running on the PC (virtual Xbox 360 pad on the PC).
  └──────────────┘                               └──────────────┘
 ```
 
-**Status: Phase 1 (input), Phase 2 (MJPEG), Phase 3 (H.264) and Steps 1–5
+**Status: Phase 1 (input), Phase 2 (MJPEG), Phase 3 (H.264) and Steps 1–6
 (weak-network defaults, feedback channel, keyframe-on-demand, adaptive bitrate,
-packet pacing) implemented.**
+packet pacing, XOR FEC) implemented.**
 The video codec is selectable (`codec` in `pc/config.ini`): **auto** (the
 default) picks H.264 when GStreamer can encode it and falls back to MJPEG
 otherwise, so the same config works on Linux and on Windows without GStreamer.
@@ -235,6 +235,7 @@ The defaults in `pc/config.ini` now target a weak/unstable Wi-Fi link:
 | `[adaptive] max_bitrate` | `6000000` | ceiling on a healthy link |
 | `[adaptive] min_fps` | `15` | lowest fps the controller may pick |
 | `pacing_ratio` | `0.6` | spread each frame over 60 % of the frame interval (Step 5) |
+| `fec_group` | `8` | one XOR parity datagram per 8 chunks (+12.5 %, Step 6) |
 
 **Quality scales (MJPEG only).** `quality` is FFmpeg `-q:v` (**lower = better**,
 2..31) while `wayland_quality` is jpegenc quality (**higher = better**, 0..100).
@@ -461,6 +462,115 @@ Measured on this machine (loopback, 720p30, ~14.7 KB access units):
 | `pacing_ratio = 0` | **0.13 ms** (one burst) | 0.007 ms |
 | `pacing_ratio = 0.6` | **18.4 ms** | 1.53 ms |
 
+## XOR FEC (Step 6)
+
+One lost datagram used to cost a whole access unit: H.264 is all-or-nothing, so
+a 1 % loss link lost ~23 % of frames (26 datagrams each) and every loss also
+forced a keyframe request. Step 6 adds a single XOR parity datagram per group of
+`fec_group` data datagrams:
+
+```
+D0 D1 D2 D3 D4 D5 D6 D7 P0   D8 ... D15 P1   ...
+                      ^ one loss in a group is rebuilt as Di = P ^ all other Dj
+```
+
+* `fec_group` (`[video]`, or `--fec-group`) = data datagrams per parity, **8 by
+  default** (+12.5 % bandwidth), **0 disables FEC** and restores the exact Step 5
+  packet stream. Two losses in the same group still kill the frame — going below
+  group 4 buys almost nothing, so that is the ABR's floor.
+* **No new packet type and no new magic**: parity reuses the 16-byte `RP4V`
+  header with `flags |= 0x04` and an **invalid `chunk_cnt` (≥ 2049)**. Every
+  pre-Step-6 receiver already rejects that, so an old PKG silently ignores parity
+  and keeps working — it just cannot recover anything. `docs/protocol.md` §7.7 has
+  the full layout and the compatibility argument.
+* The PS4 stores up to 128 parity blocks per frame (~150 KB `calloc`, failure
+  only disables FEC) and tries recovery **once, at the frame boundary**, when a
+  newer `frame_id` proves the old frame can no longer complete. Recovered chunks
+  go to `g_recovered` / the 1 Hz `dlog` line, **not** to `packets_received`, so
+  the ABR keeps an honest loss signal.
+* `pc/fec.py` holds the encoder, the parser and `FecReceiver`, an executable spec
+  of the C logic; `pc/test_fec.py` exercises both. `send_mjpeg.py` adds `fec=N`
+  to the 1 Hz line.
+* `[adaptive] fec_group_bad = 4` / `fec_group_good = 8`: the ABR tightens parity
+  when the link degrades and relaxes it when it is clean. A FEC-only change needs
+  no restart and no encoder interaction — the send loop polls it every frame.
+  Parity overhead is **on top of** `h264_bitrate`, so a bad link pays
+  `bitrate × (1 + 1/G)`.
+
+Measured on loopback with 4.5 % simulated datagram loss (720p30, 5 s, `--test-pattern`):
+
+| `fec_group` | damaged frames | rescued | still lost | bandwidth |
+|-------------|----------------|---------|------------|-----------|
+| `0` (off)   | 63 / 144       | 0       | **43.8 %** | —         |
+| `8`         | 61 / 144       | 49      | **8.3 %**  | +12.5 %   |
+| `4`         | 72 / 144       | 63      | **6.3 %**  | +25 %     |
+| `2`         | 72 / 144       | 64      | **5.6 %**  | +51 %     |
+
+Test FEC without a PS4 — a listener that drops a fraction of datagrams and
+reassembles every frame with the reference receiver:
+
+```bash
+cd pc
+# terminal 1: simulate 4 % loss on UDP 9025 and report rescued/lost frames
+python3 - <<'EOF'
+import random, socket, sys, time
+sys.path.insert(0, ".")
+from fec import FecReceiver, parse_parity
+from protocol import parse_chunk
+rnd = random.Random(1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 << 20)
+s.bind(("0.0.0.0", 9025)); s.settimeout(0.3)
+cur, cur_id, end = None, None, time.monotonic() + 6
+stats = dict(frames=0, clean=0, damaged=0, rescued=0, lost=0)
+def finish(r):
+    stats["frames"] += 1
+    if r.complete: stats["clean"] += 1; return
+    stats["damaged"] += 1
+    if r.recover() and r.complete: stats["rescued"] += 1
+    else: stats["lost"] += 1
+while time.monotonic() < end:
+    try: d, _ = s.recvfrom(2048)
+    except socket.timeout: continue
+    if rnd.random() < 0.04: continue                  # simulated loss
+    c = parse_chunk(d)
+    if c: fid, cnt = c[0].frame_id, c[0].chunk_cnt
+    else:
+        p = parse_parity(d)
+        if p is None: continue
+        fid, cnt = p.frame_id, None
+    if cur_id is None:
+        if cnt is None: continue
+        cur_id, cur = fid, FecReceiver(fid, cnt)
+    elif fid != cur_id:
+        finish(cur)
+        if cnt is None: continue
+        cur_id, cur = fid, FecReceiver(fid, cnt)
+    cur.feed(d)
+if cur: finish(cur)
+print(stats)
+EOF
+
+# terminal 2: run the sender with FEC off, then on
+python3 send_mjpeg.py --test-pattern --host 127.0.0.1 --no-feedback --duration 5 --fec-group 0
+python3 send_mjpeg.py --test-pattern --host 127.0.0.1 --no-feedback --duration 5 --fec-group 8
+```
+
+Expected: group 0 → every damaged frame is lost; group 8 → ~80 % of the damaged
+frames are rescued (see the table above) for +12.5 % packets (`pkts/s` in the 1 Hz
+line, `fec=8` field). With a real PS4 the debug log prints
+`fec: recovered N chunk(s) this second, M total in K frame(s)`.
+
+Check that the ABR steers it (two terminals again):
+
+```bash
+cd pc
+python3 tools/fake_ps4_stats.py --loss 8 &   # bad link: expect  fec group 8->4
+python3 send_mjpeg.py --test-pattern --host 127.0.0.1 --duration 20
+python3 tools/fake_ps4_stats.py --loss 0 &   # clean link: expect fec group 4->8
+python3 send_mjpeg.py --test-pattern --host 127.0.0.1 --duration 20
+```
+
 ## Viewing the PS4 log
 
 The app's `printf` is **not** visible on its own. Instead it logs through
@@ -579,6 +689,26 @@ binary struct (`RP4I`), little-endian, sent at 250 Hz. Feedback is the additive
     switching the fake to `--loss 0` produced +5 % steps every 5 s. The
     controller reacts to the PS4's real numbers only on hardware — the fake
     models frame loss as `1 - (1 - p)^chunks` (26 chunks per access unit).
+  - **Step 6 (XOR FEC) tested here**: `pc/fec.py` + `pc/test_fec.py` add 40
+    pytest cases (group field packing, parity maths with a short final block,
+    datagram parsing/rejection, and `FecReceiver` as an executable spec of
+    `ps4/src/video.c`: single loss per group recovered, two losses in one group
+    refused, a lost short last chunk restored with its true length, foreign
+    `frame_id`s ignored). End-to-end on loopback with 4.5 % simulated datagram
+    loss: group 0 lost 63/144 frames, group 8 lost 12 (**49 rescued, +12.5 %
+    bandwidth**), group 4 lost 9 (+25 %), group 2 lost 8 (+51 %, diminishing
+    returns). `fake_ps4_stats.py --loss 8` produced `fec group 8->4`, and a
+    clean link produced `fec group 4->8`. The **C implementation of parity
+    storage and recovery compiles into the PKG but has never run on a PS4**, so
+    the 128-group cap, the `calloc` failure path, and recovery timing on the
+    receive thread still need hardware. Old receivers are safe by construction
+    (`chunk_cnt > 2048` is already rejected), which is why no protocol version
+    bump was needed — but that has only been verified against the Python
+    parser and the C `handle_datagram` checks, not against an installed old PKG.
+  - A pacing bug found while testing Step 6 was fixed: `PacketPacer.wait()`
+    used to accumulate sleep overshoot as debt, reporting ~16 `late` frames/s;
+    it now re-anchors after each sleep, and only stalls larger than the minimum
+    sleep are counted (~2/s on this machine).
 - Container build artifacts were produced with clang 22 / lld 22 (Alpine) and
   packaged with the toolchain's own `PkgTool.Core` (Ubuntu 20.04 for OpenSSL
   1.1). Your OpenOrbis version may differ; if the sample Makefile flags change,

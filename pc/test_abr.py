@@ -334,3 +334,78 @@ def test_stats_interval_loss_clamps_to_100_percent():
     cur = _stats(2, 200, 100, 20, 0)
     loss, dropped, completed = stats_interval_loss(prev, cur)
     assert loss == 100.0 and dropped == 0 and completed == 10
+
+
+# --------------------------------------------------------------------------
+# Step 6: FEC strength follows the same bad/good classification
+# --------------------------------------------------------------------------
+def test_fec_starts_at_the_configured_group():
+    c = make(fec_group=8)
+    assert c.target.fec_group == 8
+    assert c.fec_enabled
+
+
+def test_fec_tightens_on_a_bad_sample_and_logs_why():
+    c = make(fec_group=8, fec_group_bad=4)
+    [d] = feed(c, [(1.0, 5.0)])
+    assert c.target.fec_group == 4
+    # The bitrate decrease wins the return value (it is the bigger change),
+    # but the FEC reason is still recorded and the target already moved.
+    assert d is not None and d.kind == "bitrate"
+    assert "fec group 8->4" in c.last_fec_reason
+    assert "loss 5.0% > 2.0%" in c.last_fec_reason
+
+
+def test_fec_change_alone_returns_none_but_moves_the_target():
+    # Already at the floor and escalation is far away: only FEC can react, and
+    # the sender polls target.fec_group every frame, so no decision is needed.
+    c = make(start_bitrate=600_000, min_bitrate=600_000, fec_group=8,
+             fec_group_bad=4, escalate_after=100)
+    [d] = feed(c, [(1.0, 9.0)])
+    assert d is None
+    assert c.target.fec_group == 4
+    assert "fec group 8->4" in c.last_fec_reason
+
+
+def test_fec_relaxes_when_the_link_is_clean_again():
+    c = make(fec_group=8, fec_group_bad=4, fec_group_good=8)
+    feed(c, [(1.0, 9.0)])
+    assert c.target.fec_group == 4
+    c.update(0.0, now=2.0)
+    c.update(0.0, now=3.0)
+    assert c.target.fec_group == 8
+    assert "fec group 4->8" in c.last_fec_reason
+
+
+def test_fec_holds_inside_the_hysteresis_band():
+    c = make(fec_group=8)
+    c.update(9.0, now=0.0)         # 8 -> 4
+    assert c.target.fec_group == 4
+    c.update(1.5, now=1.0)         # between loss_recover and loss_high
+    assert c.target.fec_group == 4
+
+
+def test_fec_disabled_by_default_stays_disabled():
+    c = make()
+    assert c.target.fec_group == 0
+    assert not c.fec_enabled
+    feed(c, [(1.0, 20.0), (1.0, 20.0)])
+    assert c.target.fec_group == 0
+    assert c.last_fec_reason == ""
+
+
+def test_fec_group_validation():
+    with pytest.raises(ValueError):
+        make(fec_group=17)
+    with pytest.raises(ValueError):
+        make(fec_group_bad=-1)
+
+
+def test_fec_change_leaves_bitrate_and_geometry_alone():
+    c = make(start_bitrate=600_000, min_bitrate=600_000, fec_group=8,
+             fec_group_bad=4, escalate_after=100)
+    before = (c.target.bitrate, c.target.fps, c.target.width, c.target.height)
+    c.update(9.0, now=0.0)
+    assert c.target.fec_group == 4
+    assert (c.target.bitrate, c.target.fps, c.target.width,
+            c.target.height) == before

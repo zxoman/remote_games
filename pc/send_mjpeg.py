@@ -54,6 +54,7 @@ from protocol import (  # noqa: E402
 from feedback import FeedbackListener  # noqa: E402
 from abr import AdaptiveBitrateController  # noqa: E402
 from pacing import PacketPacer, chunk_count  # noqa: E402
+from fec import fec_datagram_count, iter_fec_datagrams  # noqa: E402
 
 SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
@@ -103,6 +104,10 @@ DEFAULTS = {
     # Packet pacing (Step 5): spread one frame's datagrams over this fraction
     # of the frame interval. 0 = send each frame as one burst (old behaviour).
     "pacing_ratio": 0.6,
+    # XOR FEC (Step 6): one parity datagram per N data datagrams. 0 = off.
+    "fec_group": 8,
+    "abr_fec_group_bad": 4,
+    "abr_fec_group_good": 8,
 }
 
 # [adaptive] key -> cfg key. Kept as a mapping so config.ini can use short,
@@ -122,13 +127,16 @@ ADAPTIVE_KEYS = {
     "abr_drop_ratio_high": "drop_ratio_threshold",
     "abr_escalate_after": "escalate_after",
     "abr_restore_interval": "restore_interval",
+    "abr_fec_group_bad": "fec_group_bad",
+    "abr_fec_group_good": "fec_group_good",
 }
 
 _BOOL_KEYS = ("feedback_enabled", "abr_enabled", "h264_intra_refresh",
               "h264_keyframe_on_demand")
 _INT_KEYS = ("video_port", "width", "height", "fps", "quality", "wayland_quality",
              "h264_bitrate", "h264_gop", "h264_complexity", "feedback_port",
-             "min_bitrate", "max_bitrate", "min_fps", "abr_escalate_after")
+             "min_bitrate", "max_bitrate", "min_fps", "abr_escalate_after",
+             "fec_group", "abr_fec_group_bad", "abr_fec_group_good")
 _FLOAT_KEYS = ("abr_loss_high", "abr_loss_low", "abr_decrease_factor",
                "abr_increase_step", "abr_increase_interval", "abr_cooldown",
                "abr_jitter_high_ms", "abr_drop_ratio_high",
@@ -446,6 +454,9 @@ def main(argv=None):
                     help="do not listen for PS4 STATS/KEYFRAME_REQUEST packets")
     ap.add_argument("--feedback-port", type=int, dest="feedback_port",
                     help="UDP port to listen on for PS4 feedback (default 47002)")
+    ap.add_argument("--fec-group", type=int, dest="fec_group",
+                    help="XOR parity datagrams per N data chunks (0 = off, "
+                         "default 8 = +12.5%% overhead)")
     ap.add_argument("--pacing-ratio", type=float, dest="pacing_ratio",
                     help="spread a frame's packets over this fraction of the "
                          "frame interval (0 disables pacing; default 0.6)")
@@ -486,6 +497,8 @@ def main(argv=None):
         cfg["h264_complexity"] = args.h264_complexity
     if args.quality_pct is not None:
         cfg["quality_pct"] = args.quality_pct
+    if args.fec_group is not None:
+        cfg["fec_group"] = args.fec_group
     if args.pacing_ratio is not None:
         cfg["pacing_ratio"] = args.pacing_ratio
     if args.feedback_port is not None:
@@ -542,6 +555,9 @@ def main(argv=None):
     else:
         print("[send_mjpeg] --no-send: frames parsed but not transmitted")
 
+    if not 0 <= cfg["fec_group"] <= 16:
+        raise SystemExit("[send_mjpeg] fec_group must be 0..16 (0 = FEC off)")
+
     # Step 5: packet pacing. Disabled with --no-send (nothing reaches the
     # network, so sleeping would only make the local check slower).
     try:
@@ -594,6 +610,9 @@ def main(argv=None):
                 drop_ratio_high=cfg["abr_drop_ratio_high"],
                 escalate_after=cfg["abr_escalate_after"],
                 restore_interval_s=cfg["abr_restore_interval"],
+                fec_group=cfg["fec_group"],
+                fec_group_bad=cfg["abr_fec_group_bad"],
+                fec_group_good=cfg["abr_fec_group_good"],
             )
             print(f"[send_mjpeg] abr: decrease x{cfg['abr_decrease_factor']} "
                   f"when loss>{cfg['abr_loss_high']}% ; +"
@@ -628,6 +647,14 @@ def main(argv=None):
     last_stats = None
     last_restart = time.monotonic()
     abr_bitrate_changes = 0
+    # Step 6: XOR parity group. The ABR steers it between fec_group_bad and
+    # fec_group_good; without the ABR it stays at the configured value.
+    cur_fec = abr.target.fec_group if abr is not None else cfg["fec_group"]
+    if cur_fec:
+        print(f"[send_mjpeg] fec: XOR parity every {cur_fec} chunk(s) "
+              f"(+{100.0 / cur_fec:.1f}% overhead, 1 loss per group recovered)")
+    else:
+        print("[send_mjpeg] fec: disabled (fec_group = 0)")
 
     try:
         stop = False
@@ -655,12 +682,20 @@ def main(argv=None):
                             if send_encoder_keyframe(proc):
                                 kf_requests_seen += 1
 
+                # Step 6: follow the ABR's FEC decision (no restart needed).
+                if abr is not None and abr.target.fec_group != cur_fec:
+                    cur_fec = abr.target.fec_group
+                    print(f"[abr +{time.time() - start:.1f}s] "
+                          f"{abr.last_fec_reason}")
+
                 if sock is not None:
                     # Step 5: spread this frame's datagrams over part of the
                     # frame interval instead of handing the kernel one burst.
                     if pace:
-                        pacer.begin_frame(chunk_count(len(frame)))
-                    for dgram in iter_chunks(frame_id & 0xFFFFFFFF, frame, flags):
+                        pacer.begin_frame(
+                            fec_datagram_count(chunk_count(len(frame)), cur_fec))
+                    for dgram in iter_fec_datagrams(
+                            frame_id & 0xFFFFFFFF, frame, flags, cur_fec):
                         if pace:
                             pacer.wait()
                         try:
@@ -694,6 +729,8 @@ def main(argv=None):
                     if pace:
                         extra += (f" pace={pacer.ratio:.2f}"
                                   f" late={pacer.late_frames}")
+                    if cur_fec:
+                        extra += f" fec={cur_fec}"
                     st = None
                     if fb is not None:
                         st, _ts = fb.latest()
@@ -787,6 +824,9 @@ def main(argv=None):
           f"({send_drops} frames dropped on a full buffer)")
     if pace:
         print(f"[send_mjpeg] {pacer.summary()}")
+    if cur_fec:
+        print(f"[send_mjpeg] fec: group {cur_fec} "
+              f"(+{100.0 / cur_fec:.1f}% parity overhead)")
     if errno_counts:
         import errno as _errno
         pretty = ", ".join(
